@@ -29,13 +29,88 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
+    url = f"{URL[region]}/readyz"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        if resp.status_code == 200:
+            return True, "ready"
+        # try to extract reasons
+        try:
+            body = resp.json()
+            reasons = body.get("reasons", [])
+            reason = ",".join(reasons) if reasons else f"status_{resp.status_code}"
+        except Exception:
+            reason = f"status_{resp.status_code}"
+        return False, reason
+    except Exception as e:
+        return False, f"{type(e).__name__}:{e}"
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Vòng lặp poll + phát hiện transition + ghi JSONL."""
+    out = pathlib.Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Truncate at start to avoid mixing old drill events outside time window
+    # (measure.py filters by t0..hi, but clean file makes debugging easier)
+    # Keep append behavior if test expects accumulation? We truncate then append.
+    with out.open("w") as _:
+        pass
+
+    state = {"a": "HEALTHY", "b": "HEALTHY"}
+    fails = {"a": 0, "b": 0}
+
+    end = time.time() + duration
+    while time.time() < end:
+        loop_start = time.time()
+        for region in ("a", "b"):
+            ok, reason = probe(region, timeout)
+            ts = time.time()
+            iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
+            if ok:
+                fails[region] = 0
+                if state[region] == "UNHEALTHY":
+                    state[region] = "HEALTHY"
+                    rec = {
+                        "ts": ts,
+                        "iso": iso,
+                        "event": "state_change",
+                        "region": region,
+                        "to": "HEALTHY",
+                        "reason": reason,
+                        "interval_s": interval,
+                        "threshold": threshold,
+                        "consecutive_fails": 0,
+                    }
+                    with out.open("a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                    print(json.dumps(rec))
+            else:
+                fails[region] += 1
+                if fails[region] >= threshold and state[region] == "HEALTHY":
+                    state[region] = "UNHEALTHY"
+                    rec = {
+                        "ts": ts,
+                        "iso": iso,
+                        "event": "state_change",
+                        "region": region,
+                        "to": "UNHEALTHY",
+                        "reason": reason,
+                        "interval_s": interval,
+                        "threshold": threshold,
+                        "consecutive_fails": fails[region],
+                    }
+                    with out.open("a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                    print(json.dumps(rec))
+        elapsed = time.time() - loop_start
+        remain = interval - elapsed
+        if remain > 0:
+            # sleep but not beyond end
+            time.sleep(min(remain, max(0, end - time.time())))
+        else:
+            # if probing took longer than interval, yield a bit
+            time.sleep(0.01)
 
 
 if __name__ == "__main__":
